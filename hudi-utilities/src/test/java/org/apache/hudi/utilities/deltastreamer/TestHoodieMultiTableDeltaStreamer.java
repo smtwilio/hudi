@@ -254,62 +254,27 @@ public class TestHoodieMultiTableDeltaStreamer extends HoodieDeltaStreamerTestBa
 
   @Test
   public void testMultiTableContinuousModeSyncsAllTablesInParallel() throws IOException {
-    // ingest test data to 2 parquet source paths
-    String parquetSourceRoot1 = basePath + "/parquetContSrc1/";
-    prepareParquetDFSFiles(10, parquetSourceRoot1);
-    String parquetSourceRoot2 = basePath + "/parquetContSrc2/";
-    prepareParquetDFSFiles(5, parquetSourceRoot2);
-
-    String parquetPropsFile = populateCommonPropsAndWriteToFile();
-
-    HoodieMultiTableDeltaStreamer.Config cfg = TestHelpers.getConfig(parquetPropsFile, basePath + "/config", ContinuousTestSource.class.getName(), false, false,
-        false, "multi_table_parquet_continuous", null);
-    // Continuous mode blocks per table, so tables must be synced concurrently.
-    cfg.continuousMode = true;
-
-    HoodieMultiTableDeltaStreamer streamer = new HoodieMultiTableDeltaStreamer(cfg, jsc);
-    List<TableExecutionContext> executionContexts = streamer.getTableExecutionContexts();
-    ingestPerParquetSourceProps(executionContexts, Arrays.asList(parquetSourceRoot1, parquetSourceRoot2));
-    // A termination strategy ensures each table's streamer shuts down once there is no new data, so the test does not hang.
-    setTerminationStrategy(executionContexts);
-    // The source makes every table wait at a shared barrier before producing data, so a sequential implementation
-    // would block the first table forever and time out. Only concurrent syncs let all tables pass the barrier.
-    ContinuousTestSource.resetBarrier(executionContexts.size());
-
-    String targetBasePath1 = executionContexts.get(0).getConfig().targetBasePath;
-    String targetBasePath2 = executionContexts.get(1).getConfig().targetBasePath;
+    HoodieMultiTableDeltaStreamer streamer = setupContinuousStreamer("parquetContinuous", false);
+    List<TableExecutionContext> contexts = streamer.getTableExecutionContexts();
+    // Let each table stop on its own once it has ingested its data, so the test does not run forever.
+    setTerminationStrategy(contexts);
 
     streamer.sync();
 
     assertEquals(2, streamer.getSuccessTables().size());
     assertTrue(streamer.getFailedTables().isEmpty());
-    assertRecordCount(10, targetBasePath1, sqlContext);
-    assertRecordCount(5, targetBasePath2, sqlContext);
+    assertRecordCount(10, contexts.get(0).getConfig().targetBasePath, sqlContext);
+    assertRecordCount(5, contexts.get(1).getConfig().targetBasePath, sqlContext);
   }
 
   @Test
   public void testFailFastOnContinuousThrowsWhenATableFails() throws IOException, InterruptedException {
-    String parquetSourceRoot1 = basePath + "/parquetFailFastSrc1/";
-    prepareParquetDFSFiles(10, parquetSourceRoot1);
-    String parquetSourceRoot2 = basePath + "/parquetFailFastSrc2/";
-    prepareParquetDFSFiles(5, parquetSourceRoot2);
-
-    String parquetPropsFile = populateCommonPropsAndWriteToFile();
-
-    HoodieMultiTableDeltaStreamer.Config cfg = TestHelpers.getConfig(parquetPropsFile, basePath + "/config", ContinuousTestSource.class.getName(), false, false,
-        false, "multi_table_parquet_fail_fast", null);
-    cfg.continuousMode = true;
-    cfg.failFastOnContinuousMode = true;
-
-    HoodieMultiTableDeltaStreamer streamer = new HoodieMultiTableDeltaStreamer(cfg, jsc);
-    List<TableExecutionContext> executionContexts = streamer.getTableExecutionContexts();
-    ingestPerParquetSourceProps(executionContexts, Arrays.asList(parquetSourceRoot1, parquetSourceRoot2));
-    ContinuousTestSource.resetBarrier(executionContexts.size());
-    // Both tables pass the barrier first, so both are guaranteed to be running before anything fails. The first table
-    // then blocks indefinitely; only fail fast interrupting it can end its sync. The second table fails after the
-    // barrier. This proves fail-fast tears down a sibling that is still actively running, not one that stopped on its own.
-    executionContexts.get(0).getProperties().setProperty(ContinuousTestSource.BLOCK_UNTIL_INTERRUPTED, "true");
-    executionContexts.get(1).getProperties().setProperty(ContinuousTestSource.FAIL_AFTER_BARRIER, "true");
+    HoodieMultiTableDeltaStreamer streamer = setupContinuousStreamer("parquetFailFast", true);
+    List<TableExecutionContext> contexts = streamer.getTableExecutionContexts();
+    // Table 1 blocks after the barrier, so only fail fast interrupting it can end its sync. Table 2 fails after the
+    // barrier. This proves fail fast tears down a sibling that is still actively running, not one that stopped itself.
+    contexts.get(0).getProperties().setProperty(ContinuousTestSource.BLOCK_UNTIL_INTERRUPTED, "true");
+    contexts.get(1).getProperties().setProperty(ContinuousTestSource.FAIL_AFTER_BARRIER, "true");
 
     assertThrows(HoodieException.class, streamer::sync);
     assertFalse(streamer.getFailedTables().isEmpty());
@@ -319,29 +284,12 @@ public class TestHoodieMultiTableDeltaStreamer extends HoodieDeltaStreamerTestBa
 
   @Test
   public void testContinuousModeDefaultDoesNotStopSiblingsWhenATableFails() throws IOException {
-    String parquetSourceRoot1 = basePath + "/parquetNoFailFastSrc1/";
-    prepareParquetDFSFiles(10, parquetSourceRoot1);
-    String parquetSourceRoot2 = basePath + "/parquetNoFailFastSrc2/";
-    prepareParquetDFSFiles(5, parquetSourceRoot2);
-
-    String parquetPropsFile = populateCommonPropsAndWriteToFile();
-
-    HoodieMultiTableDeltaStreamer.Config cfg = TestHelpers.getConfig(parquetPropsFile, basePath + "/config", ContinuousTestSource.class.getName(), false, false,
-        false, "multi_table_parquet_no_fail_fast", null);
-    cfg.continuousMode = true;
-    // Fail fast disabled (default): one table failing must not stop the others.
-    cfg.failFastOnContinuousMode = false;
-
-    HoodieMultiTableDeltaStreamer streamer = new HoodieMultiTableDeltaStreamer(cfg, jsc);
-    List<TableExecutionContext> executionContexts = streamer.getTableExecutionContexts();
-    ingestPerParquetSourceProps(executionContexts, Arrays.asList(parquetSourceRoot1, parquetSourceRoot2));
-    setTerminationStrategy(executionContexts);
-    ContinuousTestSource.resetBarrier(executionContexts.size());
-    // Both tables pass the barrier first, so both are running before the failure. The second table then fails while
-    // the first ingests normally and terminates on its own. With fail fast off, the failure must not stop the first.
-    executionContexts.get(1).getProperties().setProperty(ContinuousTestSource.FAIL_AFTER_BARRIER, "true");
-
-    String targetBasePath1 = executionContexts.get(0).getConfig().targetBasePath;
+    HoodieMultiTableDeltaStreamer streamer = setupContinuousStreamer("parquetNoFailFast", false);
+    List<TableExecutionContext> contexts = streamer.getTableExecutionContexts();
+    setTerminationStrategy(contexts);
+    // Table 2 fails after the barrier while table 1 ingests normally. With fail fast off, the failure of one table
+    // must not stop the other.
+    contexts.get(1).getProperties().setProperty(ContinuousTestSource.FAIL_AFTER_BARRIER, "true");
 
     // sync() must complete without throwing even though one table failed.
     streamer.sync();
@@ -349,7 +297,30 @@ public class TestHoodieMultiTableDeltaStreamer extends HoodieDeltaStreamerTestBa
     assertEquals(1, streamer.getSuccessTables().size());
     assertEquals(1, streamer.getFailedTables().size());
     // The healthy table still ingested all of its records.
-    assertRecordCount(10, targetBasePath1, sqlContext);
+    assertRecordCount(10, contexts.get(0).getConfig().targetBasePath, sqlContext);
+  }
+
+  /**
+   * Builds a two-table continuous-mode streamer backed by {@link ContinuousTestSource} (10 and 5 records). The source
+   * makes every table wait at a shared barrier before producing data, so a sequential implementation would block the
+   * first table forever and time out; only truly concurrent syncs let all tables pass the barrier.
+   */
+  private HoodieMultiTableDeltaStreamer setupContinuousStreamer(String namePrefix, boolean failFast) throws IOException {
+    String sourceRoot1 = basePath + "/" + namePrefix + "Src1/";
+    String sourceRoot2 = basePath + "/" + namePrefix + "Src2/";
+    prepareParquetDFSFiles(10, sourceRoot1);
+    prepareParquetDFSFiles(5, sourceRoot2);
+
+    HoodieMultiTableDeltaStreamer.Config cfg = TestHelpers.getConfig(populateCommonPropsAndWriteToFile(), basePath + "/config",
+        ContinuousTestSource.class.getName(), false, false, false, "multi_table_" + namePrefix, null);
+    cfg.continuousMode = true;
+    cfg.failFastOnContinuousMode = failFast;
+
+    HoodieMultiTableDeltaStreamer streamer = new HoodieMultiTableDeltaStreamer(cfg, jsc);
+    List<TableExecutionContext> contexts = streamer.getTableExecutionContexts();
+    ingestPerParquetSourceProps(contexts, Arrays.asList(sourceRoot1, sourceRoot2));
+    ContinuousTestSource.resetBarrier(contexts.size());
+    return streamer;
   }
 
   private void setTerminationStrategy(List<TableExecutionContext> executionContexts) {
